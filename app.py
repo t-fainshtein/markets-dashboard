@@ -32,7 +32,15 @@ st.set_page_config(
 
 # ---------- API keys ----------
 # Reads FRED_API_KEY from Streamlit secrets (when deployed) or env var (locally).
-FRED_API_KEY = st.secrets.get("FRED_API_KEY", os.environ.get("FRED_API_KEY", ""))
+# Wrapped in try/except so a missing secrets.toml doesn't crash the app.
+def _load_fred_key() -> str:
+    try:
+        return st.secrets.get("FRED_API_KEY", os.environ.get("FRED_API_KEY", ""))
+    except Exception:
+        return os.environ.get("FRED_API_KEY", "")
+
+
+FRED_API_KEY = _load_fred_key()
 
 # ---------- Caching wrappers ----------
 # Cache for 10 minutes so we don't hammer the APIs during a session.
@@ -67,15 +75,29 @@ def yf_history(ticker: str, period: str = "2y") -> pd.DataFrame:
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def stooq_series(ticker: str) -> pd.Series:
-    """Pull daily close from Stooq for sovereign yield tickers like 10deby.b."""
-    try:
-        import pandas_datareader.data as pdr
+def ecb_series(series_key: str) -> pd.Series:
+    """Pull a daily series from the ECB Data Portal (free, no auth).
+    Used for euro-area AAA government bond yields (proxy for Bund).
+    """
+    import io
+    import requests
 
-        end = dt.date.today()
-        start = end - dt.timedelta(days=400)
-        df = pdr.DataReader(ticker, "stooq", start, end).sort_index()
-        return df["Close"].dropna()
+    url = (
+        f"https://data-api.ecb.europa.eu/service/data/YC/{series_key}"
+        f"?format=csvdata&lastNObservations=500"
+    )
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or not r.text:
+            return pd.Series(dtype=float)
+        df = pd.read_csv(io.StringIO(r.text))
+        if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
+            return pd.Series(dtype=float)
+        s = pd.Series(
+            df["OBS_VALUE"].astype(float).values,
+            index=pd.to_datetime(df["TIME_PERIOD"]),
+        ).sort_index()
+        return s.dropna()
     except Exception:
         return pd.Series(dtype=float)
 
@@ -132,8 +154,8 @@ def quote_from_yf(ticker: str, is_yield: bool = False) -> Quote:
     return latest_and_changes_from_series(df["Close"], is_yield=is_yield)
 
 
-def quote_from_stooq(ticker: str, is_yield: bool = True) -> Quote:
-    s = stooq_series(ticker)
+def quote_from_ecb(series_key: str, is_yield: bool = True) -> Quote:
+    s = ecb_series(series_key)
     return latest_and_changes_from_series(s, is_yield=is_yield)
 
 
@@ -182,7 +204,7 @@ def color(v: Optional[float], invert: bool = False) -> str:
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 1rem; padding-bottom: 1rem; max-width: 1400px; }
+    .block-container { padding-top: 4rem; padding-bottom: 1rem; max-width: 1400px; }
     h1.dash-title {
         background-color: #1f3864;
         color: white;
@@ -193,21 +215,32 @@ st.markdown(
         border-radius: 4px;
     }
     .section-header {
-        background-color: #cfd8e8;
+        background-color: #1f3864;
+        color: white;
         font-weight: 700;
-        padding: 4px 8px;
-        margin-top: 8px;
+        padding: 6px 10px;
+        margin-top: 10px;
         margin-bottom: 4px;
-        border-bottom: 1px solid #1f3864;
+        font-size: 15px;
+        letter-spacing: 0.3px;
     }
     .sub-header {
-        background-color: #e8edf5;
+        background-color: #2e5597;
+        color: white;
         font-weight: 600;
-        padding: 3px 8px;
+        padding: 4px 10px;
         font-size: 14px;
+        margin-top: 4px;
     }
     table.dash { width: 100%; border-collapse: collapse; font-size: 13px; }
-    table.dash th { text-align: right; padding: 4px 8px; color: #555; font-weight: 600; border-bottom: 1px solid #ccc; }
+    table.dash th {
+        text-align: right;
+        padding: 5px 8px;
+        color: white;
+        background-color: #4472c4;
+        font-weight: 600;
+        border-bottom: 1px solid #1f3864;
+    }
     table.dash td { padding: 3px 8px; border-bottom: 1px solid #f0f0f0; }
     table.dash td.label { text-align: left; }
     table.dash td.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -241,7 +274,7 @@ left, right = st.columns(2)
 def render_yield_block(title: str, rows: list[tuple[str, Quote]]) -> str:
     """Build an HTML table for a yield block (rate label + last + Δ1w + ΔYTD)."""
     html = [f"<div class='sub-header'>{title}</div>"]
-    html.append("<table class='dash'><tr><th></th><th>Last</th><th>Δ1w</th><th>ΔYTD</th></tr>")
+    html.append("<table class='dash'><tr><th></th><th>Last</th><th>1 week change</th><th>YTD change</th></tr>")
     for label, q in rows:
         html.append(
             f"<tr>"
@@ -269,33 +302,30 @@ with left:
     ]
     st.markdown(render_yield_block("United States", us_rows), unsafe_allow_html=True)
 
-    # Germany — Stooq tickers
+    # Germany — ECB euro-area AAA spot curve (daily, free public API)
     de_rows = [
-        ("2y", quote_from_stooq("2deby.b")),
-        ("10y", quote_from_stooq("10deby.b")),
+        ("2y", quote_from_ecb("B.U2.EUR.4F.G_N_A.SV_C_YM.SR_2Y")),
+        ("10y", quote_from_ecb("B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y")),
     ]
-    st.markdown(render_yield_block("Germany", de_rows), unsafe_allow_html=True)
+    st.markdown(render_yield_block("Germany (EUR AAA proxy)", de_rows), unsafe_allow_html=True)
 
-    # Japan
+    # Japan — FRED long-term rate (monthly)
     jp_rows = [
-        ("2y", quote_from_stooq("2jpy.b")),
-        ("10y", quote_from_stooq("10jpy.b")),
+        ("10y", quote_from_fred("IRLTLT01JPM156N")),
     ]
-    st.markdown(render_yield_block("Japan", jp_rows), unsafe_allow_html=True)
+    st.markdown(render_yield_block("Japan (monthly)", jp_rows), unsafe_allow_html=True)
 
-    # United Kingdom
+    # United Kingdom — FRED long-term rate (monthly)
     uk_rows = [
-        ("2y", quote_from_stooq("2uky.b")),
-        ("10y", quote_from_stooq("10uky.b")),
+        ("10y", quote_from_fred("IRLTLT01GBM156N")),
     ]
-    st.markdown(render_yield_block("United Kingdom", uk_rows), unsafe_allow_html=True)
+    st.markdown(render_yield_block("United Kingdom (monthly)", uk_rows), unsafe_allow_html=True)
 
-    # China (onshore)
+    # China — FRED long-term rate (monthly)
     cn_rows = [
-        ("2y", quote_from_stooq("2cny.b")),
-        ("10y", quote_from_stooq("10cny.b")),
+        ("10y", quote_from_fred("IRLTLT01CNM156N")),
     ]
-    st.markdown(render_yield_block("China (onshore)", cn_rows), unsafe_allow_html=True)
+    st.markdown(render_yield_block("China (monthly)", cn_rows), unsafe_allow_html=True)
 
 
 # ---------- Right column: Policy / Curves / Credit ----------
@@ -305,6 +335,7 @@ with right:
     # Policy rates
     policy_pairs = [
         ("Fed funds (upper)", "DFEDTARU"),
+        ("Fed funds (lower)", "DFEDTARL"),
         ("ECB MRO", "ECBMRRFR"),
         ("BOJ Policy Rate", "IRSTCB01JPM156N"),
         ("BoE Bank Rate", "IUDSOIA"),
@@ -334,19 +365,13 @@ with right:
     us30 = us_rows[4][1]
     de2 = de_rows[0][1]
     de10 = de_rows[1][1]
-    jp2 = jp_rows[0][1]
-    jp10 = jp_rows[1][1]
-    uk2 = uk_rows[0][1]
-    uk10 = uk_rows[1][1]
-    cn2 = cn_rows[0][1]
-    cn10 = cn_rows[1][1]
+    jp10 = jp_rows[0][1]
+    uk10 = uk_rows[0][1]
+    cn10 = cn_rows[0][1]
 
     curves = [
         ("United States", spread_bps(us2, us10), spread_bps(us5, us30)),
-        ("Germany", spread_bps(de2, de10), None),
-        ("Japan", spread_bps(jp2, jp10), None),
-        ("United Kingdom", spread_bps(uk2, uk10), None),
-        ("China", spread_bps(cn2, cn10), None),
+        ("Germany (EUR AAA)", spread_bps(de2, de10), None),
     ]
     html = ["<div class='sub-header'>Curves (bps)</div>"]
     html.append("<table class='dash'><tr><th></th><th>2s/10s</th><th>5s/30s</th></tr>")
@@ -371,7 +396,7 @@ with right:
     html.append("<table class='dash'><tr><th></th><th>Last</th><th>Spread (bps)</th></tr>")
     for label, yld_id, oas_id in credit_rows:
         if label.startswith("GER-ITA"):
-            ita10 = quote_from_stooq("10ity.b")
+            ita10 = quote_from_fred("IRLTLT01ITM156N")
             spread = (
                 (ita10.last - de10.last) * 100
                 if (ita10.last is not None and de10.last is not None)
@@ -408,11 +433,11 @@ def render_price_block(title: str, rows: list[tuple[str, str, int]], show_52w: b
     html = [f"<div class='sub-header'>{title}</div>"]
     if show_52w:
         html.append(
-            "<table class='dash'><tr><th></th><th>Last</th><th>Δ1w</th><th>ΔYTD</th><th>52-wk Hi</th></tr>"
+            "<table class='dash'><tr><th></th><th>Last</th><th>1 week change</th><th>YTD change</th><th>52-wk Hi</th></tr>"
         )
     else:
         html.append(
-            "<table class='dash'><tr><th></th><th>Last</th><th>Δ1w</th><th>ΔYTD</th></tr>"
+            "<table class='dash'><tr><th></th><th>Last</th><th>1 week change</th><th>YTD change</th></tr>"
         )
     for label, ticker, decimals in rows:
         q = quote_from_yf(ticker, is_yield=False)
