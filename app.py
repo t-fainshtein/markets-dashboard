@@ -319,7 +319,8 @@ st.markdown(
         margin-top: 10px;
         margin-bottom: 4px;
         font-size: 15px;
-        letter-spacing: 0.3px;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
     }
     .sub-header {
         background-color: #2e5597;
@@ -440,7 +441,7 @@ with tab1:
     def render_yield_block(title: str, rows: list[tuple[str, Quote]]) -> str:
         """Build an HTML table for a yield block (rate label + last + Δ1w + ΔYTD)."""
         html = [f"<div class='sub-header'>{title}</div>"]
-        html.append("<table class='dash'><tr><th></th><th>Last</th><th>1 week change</th><th>YTD change</th></tr>")
+        html.append("<table class='dash'><tr><th></th><th>Last</th><th>1 Week Change</th><th>YTD Change</th></tr>")
         for label, q in rows:
             html.append(
                 f"<tr>"
@@ -540,7 +541,7 @@ with tab1:
             ("Japan", spread_bps(jp2, jp10), spread_bps(jp5, jp30)),
             ("United Kingdom", spread_bps(uk2, uk10), spread_bps(uk5, uk30)),
         ]
-        html = ["<div class='sub-header'>Curves (bps)</div>"]
+        html = ["<div class='sub-header'>Curves (Bps)</div>"]
         html.append("<table class='dash'><tr><th></th><th>2s/10s</th><th>5s/30s</th></tr>")
         for label, s210, s530 in curves:
             html.append(
@@ -589,7 +590,7 @@ with tab1:
             ("GER-ITA 10y spread", None, None, ger_ita_spread_bps),
         ]
         html = ["<div class='sub-header'>Credit</div>"]
-        html.append("<table class='dash'><tr><th></th><th>Last</th><th>Spread (bps)</th></tr>")
+        html.append("<table class='dash'><tr><th></th><th>Last</th><th>Spread (Bps)</th></tr>")
         for label, yld_id, oas_id, spread_fn in credit_rows:
             if yld_id == "__MUNI__":
                 last, spread_bp = muni_yield_and_spread()
@@ -625,11 +626,11 @@ with tab1:
         html = [f"<div class='sub-header'>{title}</div>"]
         if show_52w:
             html.append(
-                "<table class='dash'><tr><th></th><th>Last</th><th>1 week change</th><th>YTD change</th><th>52-wk Hi</th></tr>"
+                "<table class='dash'><tr><th></th><th>Last</th><th>1 Week Change</th><th>YTD Change</th><th>52-Wk Hi</th></tr>"
             )
         else:
             html.append(
-                "<table class='dash'><tr><th></th><th>Last</th><th>1 week change</th><th>YTD change</th></tr>"
+                "<table class='dash'><tr><th></th><th>Last</th><th>1 Week Change</th><th>YTD Change</th></tr>"
             )
         for label, ticker, decimals in rows:
             q = quote_from_yf(ticker, is_yield=False)
