@@ -49,15 +49,41 @@ CACHE_TTL = 60 * 10
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fred_series(series_id: str, start: Optional[dt.date] = None) -> pd.Series:
-    """Pull a single FRED series. Returns an empty Series on failure."""
-    if not FRED_API_KEY:
-        return pd.Series(dtype=float)
-    try:
-        from fredapi import Fred
+    """Pull a single FRED series. Tries the fredapi (with key) first; if that
+    fails or returns nothing, falls back to the public fredgraph CSV endpoint
+    so the dashboard still populates even if the key is missing or the
+    fredapi package has issues.
+    """
+    # Path 1: fredapi (preferred when a key is present)
+    if FRED_API_KEY:
+        try:
+            from fredapi import Fred
 
-        fred = Fred(api_key=FRED_API_KEY)
-        s = fred.get_series(series_id, observation_start=start)
-        return s.dropna()
+            fred = Fred(api_key=FRED_API_KEY)
+            s = fred.get_series(series_id, observation_start=start)
+            s = s.dropna()
+            if not s.empty:
+                return s
+        except Exception:
+            pass
+
+    # Path 2: public fredgraph CSV (no auth required)
+    try:
+        import io
+        import requests
+
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        if start is not None:
+            url += f"&cosd={start.isoformat()}"
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or not r.text.startswith("observation_date"):
+            return pd.Series(dtype=float)
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = ["date", "val"]
+        df["date"] = pd.to_datetime(df["date"])
+        df["val"] = pd.to_numeric(df["val"], errors="coerce")
+        df = df.dropna()
+        return pd.Series(df["val"].values, index=df["date"]).sort_index()
     except Exception:
         return pd.Series(dtype=float)
 
@@ -74,30 +100,73 @@ def yf_history(ticker: str, period: str = "2y") -> pd.DataFrame:
         return pd.DataFrame()
 
 
+WSJ_ENTITLEMENT = "cecc4267a0194af89ca343805a3e57af"
+
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def ecb_series(series_key: str) -> pd.Series:
-    """Pull a daily series from the ECB Data Portal (free, no auth).
-    Used for euro-area AAA government bond yields (proxy for Bund).
+def wsj_bond_series(ticker: str) -> pd.Series:
+    """Pull a 2-year daily history for a benchmark sovereign bond yield from
+    the MarketWatch/WSJ public Michelangelo timeseries endpoint.
+    ticker examples: 'TMBMKDE-10Y' (DE 10y), 'TMBMKJP-02Y', 'TMBMKGB-10Y',
+    'TMBMKIT-10Y', 'TMUBMUSD10Y'.
     """
-    import io
+    import json as _json
+    import urllib.parse
     import requests
 
+    if ticker.startswith("TMUBMUSD"):
+        key = f"BOND/BX//{ticker}"
+    else:
+        key = f"BOND/BX//{ticker}"
+    payload = {
+        "Step": "P1D",
+        "TimeFrame": "P2Y",
+        "StartDate": None,
+        "EndDate": None,
+        "EntitlementToken": WSJ_ENTITLEMENT,
+        "IncludeMockTicks": False,
+        "FilterNullSlots": False,
+        "FilterClosedPoints": True,
+        "IncludeOriginalTimeStamps": False,
+        "IncludeOfficialClose": True,
+        "ExcludeNonOfficialPriceTypes": True,
+        "Series": [
+            {
+                "Key": key,
+                "Dialect": "Charting",
+                "Kind": "Ticker",
+                "SeriesId": "s1",
+                "DataTypes": ["Last"],
+                "Indicators": [],
+            }
+        ],
+    }
+    q = urllib.parse.quote(_json.dumps(payload, separators=(",", ":")))
     url = (
-        f"https://data-api.ecb.europa.eu/service/data/YC/{series_key}"
-        f"?format=csvdata&lastNObservations=500"
+        f"https://api-secure.wsj.net/api/michelangelo/timeseries/history?"
+        f"json={q}&ckey=cecc4267a0"
     )
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Dylan2010.EntitlementToken": WSJ_ENTITLEMENT,
+        "Accept": "application/json",
+        "Origin": "https://www.marketwatch.com",
+        "Referer": "https://www.marketwatch.com/",
+    }
     try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200 or not r.text:
+        r = requests.get(url, timeout=20, headers=headers)
+        if r.status_code != 200:
             return pd.Series(dtype=float)
-        df = pd.read_csv(io.StringIO(r.text))
-        if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
+        data = r.json()
+        series = data.get("Series", [{}])[0]
+        points = series.get("DataPoints", [])
+        ticks = data.get("TimeInfo", {}).get("Ticks", [])
+        if not points or not ticks or len(points) != len(ticks):
             return pd.Series(dtype=float)
-        s = pd.Series(
-            df["OBS_VALUE"].astype(float).values,
-            index=pd.to_datetime(df["TIME_PERIOD"]),
-        ).sort_index()
-        return s.dropna()
+        idx = pd.to_datetime(ticks, unit="ms")
+        vals = [p[0] if p and p[0] is not None else None for p in points]
+        s = pd.Series(vals, index=idx).astype(float).dropna().sort_index()
+        return s
     except Exception:
         return pd.Series(dtype=float)
 
@@ -154,8 +223,8 @@ def quote_from_yf(ticker: str, is_yield: bool = False) -> Quote:
     return latest_and_changes_from_series(df["Close"], is_yield=is_yield)
 
 
-def quote_from_ecb(series_key: str, is_yield: bool = True) -> Quote:
-    s = ecb_series(series_key)
+def quote_from_wsj(ticker: str, is_yield: bool = True) -> Quote:
+    s = wsj_bond_series(ticker)
     return latest_and_changes_from_series(s, is_yield=is_yield)
 
 
@@ -302,30 +371,32 @@ with left:
     ]
     st.markdown(render_yield_block("United States", us_rows), unsafe_allow_html=True)
 
-    # Germany — ECB euro-area AAA spot curve (daily, free public API)
+    # Germany — WSJ benchmark Bund yields (daily, real numbers)
     de_rows = [
-        ("2y", quote_from_ecb("B.U2.EUR.4F.G_N_A.SV_C_YM.SR_2Y")),
-        ("10y", quote_from_ecb("B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y")),
+        ("2y", quote_from_wsj("TMBMKDE-02Y")),
+        ("5y", quote_from_wsj("TMBMKDE-05Y")),
+        ("10y", quote_from_wsj("TMBMKDE-10Y")),
+        ("30y", quote_from_wsj("TMBMKDE-30Y")),
     ]
-    st.markdown(render_yield_block("Germany (EUR AAA proxy)", de_rows), unsafe_allow_html=True)
+    st.markdown(render_yield_block("Germany", de_rows), unsafe_allow_html=True)
 
-    # Japan — FRED long-term rate (monthly)
+    # Japan
     jp_rows = [
-        ("10y", quote_from_fred("IRLTLT01JPM156N")),
+        ("2y", quote_from_wsj("TMBMKJP-02Y")),
+        ("5y", quote_from_wsj("TMBMKJP-05Y")),
+        ("10y", quote_from_wsj("TMBMKJP-10Y")),
+        ("30y", quote_from_wsj("TMBMKJP-30Y")),
     ]
-    st.markdown(render_yield_block("Japan (monthly)", jp_rows), unsafe_allow_html=True)
+    st.markdown(render_yield_block("Japan", jp_rows), unsafe_allow_html=True)
 
-    # United Kingdom — FRED long-term rate (monthly)
+    # United Kingdom
     uk_rows = [
-        ("10y", quote_from_fred("IRLTLT01GBM156N")),
+        ("2y", quote_from_wsj("TMBMKGB-02Y")),
+        ("5y", quote_from_wsj("TMBMKGB-05Y")),
+        ("10y", quote_from_wsj("TMBMKGB-10Y")),
+        ("30y", quote_from_wsj("TMBMKGB-30Y")),
     ]
-    st.markdown(render_yield_block("United Kingdom (monthly)", uk_rows), unsafe_allow_html=True)
-
-    # China — FRED long-term rate (monthly)
-    cn_rows = [
-        ("10y", quote_from_fred("IRLTLT01CNM156N")),
-    ]
-    st.markdown(render_yield_block("China (monthly)", cn_rows), unsafe_allow_html=True)
+    st.markdown(render_yield_block("United Kingdom", uk_rows), unsafe_allow_html=True)
 
 
 # ---------- Right column: Policy / Curves / Credit ----------
@@ -337,8 +408,10 @@ with right:
         ("Fed funds (upper)", "DFEDTARU"),
         ("Fed funds (lower)", "DFEDTARL"),
         ("ECB MRO", "ECBMRRFR"),
-        ("BOJ Policy Rate", "IRSTCB01JPM156N"),
-        ("BoE Bank Rate", "IUDSOIA"),
+        # IRSTCI01JPM156N = Japan immediate rate (monthly), tracks BOJ policy rate.
+        ("BOJ Policy Rate (mo)", "IRSTCI01JPM156N"),
+        # IUDSOIA = SONIA, BoE's official policy benchmark since 2018 (daily).
+        ("BoE SONIA (≈Bank Rate)", "IUDSOIA"),
         ("CN Loan Prime Rate (1y)", "IR3TIB01CNM156N"),
     ]
     rows_html = ["<div class='sub-header'>Policy</div>"]
@@ -359,19 +432,16 @@ with right:
             return None
         return (long.last - short.last) * 100
 
-    us2 = us_rows[0][1]
-    us5 = us_rows[1][1]
-    us10 = us_rows[3][1]
-    us30 = us_rows[4][1]
-    de2 = de_rows[0][1]
-    de10 = de_rows[1][1]
-    jp10 = jp_rows[0][1]
-    uk10 = uk_rows[0][1]
-    cn10 = cn_rows[0][1]
+    us2, us5, _, us10, us30 = (r[1] for r in us_rows)
+    de2, de5, de10, de30 = (r[1] for r in de_rows)
+    jp2, jp5, jp10, jp30 = (r[1] for r in jp_rows)
+    uk2, uk5, uk10, uk30 = (r[1] for r in uk_rows)
 
     curves = [
         ("United States", spread_bps(us2, us10), spread_bps(us5, us30)),
-        ("Germany (EUR AAA)", spread_bps(de2, de10), None),
+        ("Germany", spread_bps(de2, de10), spread_bps(de5, de30)),
+        ("Japan", spread_bps(jp2, jp10), spread_bps(jp5, jp30)),
+        ("United Kingdom", spread_bps(uk2, uk10), spread_bps(uk5, uk30)),
     ]
     html = ["<div class='sub-header'>Curves (bps)</div>"]
     html.append("<table class='dash'><tr><th></th><th>2s/10s</th><th>5s/30s</th></tr>")
@@ -385,37 +455,71 @@ with right:
     st.markdown("".join(html), unsafe_allow_html=True)
 
     # Credit (yields + option-adjusted spreads in bps)
+    # Each entry: (label, yield_fred_id, spread_fred_id_or_None, custom_spread_fn_or_None)
+    dgs10_series = fred_series("DGS10")
+    dgs10_last = float(dgs10_series.iloc[-1]) if not dgs10_series.empty else None
+
+    def mortgage_spread_bps() -> Optional[float]:
+        m = fred_series("MORTGAGE30US")
+        if m.empty or dgs10_last is None:
+            return None
+        return (float(m.iloc[-1]) - dgs10_last) * 100
+
+    def ger_ita_spread_bps() -> Optional[float]:
+        ita10 = quote_from_wsj("TMBMKIT-10Y")
+        if ita10.last is None or de10.last is None:
+            return None
+        return (ita10.last - de10.last) * 100
+
+    # Muni: ICE BofA muni indices were discontinued on FRED. We use the
+    # iShares National Muni ETF (MUB) yield-to-maturity proxy via Yahoo Finance,
+    # which is what most free dashboards use. The SEC 30-day yield from MUB's
+    # info object is a clean industry-standard read.
+    def muni_yield_and_spread() -> tuple[Optional[float], Optional[float]]:
+        try:
+            import yfinance as yf
+
+            info = yf.Ticker("MUB").info or {}
+            y = info.get("yield")
+            if y is None:
+                y = info.get("trailingAnnualDividendYield")
+            yld_pct = float(y) * 100 if y else None
+            spread_bp = (
+                (yld_pct - dgs10_last) * 100
+                if (yld_pct is not None and dgs10_last is not None)
+                else None
+            )
+            return yld_pct, spread_bp
+        except Exception:
+            return None, None
+
     credit_rows = [
-        ("Mortgage 30y (Freddie)", "MORTGAGE30US", None),
-        ("ICE BofA US Corp Index Yield", "BAMLC0A0CMEY", "BAMLC0A0CM"),
-        ("ICE BofA US HY Index Yield", "BAMLH0A0HYM2EY", "BAMLH0A0HYM2"),
-        ("ICE BofA Muni Index Yield", "BAMLU0A0MAEY", None),
-        ("GER-ITA 10y spread", None, None),  # computed below
+        ("Mortgage 30y (Freddie)", "MORTGAGE30US", None, mortgage_spread_bps),
+        ("ICE BofA US Corp Index Yield", "BAMLC0A0CMEY", "BAMLC0A0CM", None),
+        ("ICE BofA US HY Index Yield", "BAMLH0A0HYM2EY", "BAMLH0A0HYM2", None),
+        ("Muni ETF Yield (MUB SEC)", "__MUNI__", None, None),
+        ("GER-ITA 10y spread", None, None, ger_ita_spread_bps),
     ]
     html = ["<div class='sub-header'>Credit</div>"]
     html.append("<table class='dash'><tr><th></th><th>Last</th><th>Spread (bps)</th></tr>")
-    for label, yld_id, oas_id in credit_rows:
-        if label.startswith("GER-ITA"):
-            ita10 = quote_from_fred("IRLTLT01ITM156N")
-            spread = (
-                (ita10.last - de10.last) * 100
-                if (ita10.last is not None and de10.last is not None)
-                else None
-            )
-            html.append(
-                f"<tr><td class='label'>{label}</td>"
-                f"<td class='num'>—</td>"
-                f"<td class='num'>{fmt_bp(spread)}</td></tr>"
-            )
-            continue
-        s = fred_series(yld_id) if yld_id else pd.Series(dtype=float)
-        oas = fred_series(oas_id) if oas_id else pd.Series(dtype=float)
-        last = float(s.iloc[-1]) if not s.empty else None
-        oas_last = float(oas.iloc[-1]) * 100 if not oas.empty else None  # FRED OAS is in %
+    for label, yld_id, oas_id, spread_fn in credit_rows:
+        if yld_id == "__MUNI__":
+            last, spread_bp = muni_yield_and_spread()
+        else:
+            s = fred_series(yld_id) if yld_id else pd.Series(dtype=float)
+            last = float(s.iloc[-1]) if not s.empty else None
+            if spread_fn is not None:
+                spread_bp = spread_fn()
+            elif oas_id is not None:
+                oas = fred_series(oas_id)
+                # FRED OAS values are already in percent; multiply by 100 for bps.
+                spread_bp = float(oas.iloc[-1]) * 100 if not oas.empty else None
+            else:
+                spread_bp = None
         html.append(
             f"<tr><td class='label'>{label}</td>"
             f"<td class='num'>{fmt_yield(last)}</td>"
-            f"<td class='num'>{fmt_bp(oas_last)}</td></tr>"
+            f"<td class='num'>{fmt_bp(spread_bp)}</td></tr>"
         )
     html.append("</table>")
     st.markdown("".join(html), unsafe_allow_html=True)
@@ -501,7 +605,7 @@ with ot_left:
         ("EURUSD", "EURUSD=X", 4),
         ("USDJPY", "JPY=X", 2),
         ("GBPUSD", "GBPUSD=X", 4),
-        ("USDCNH", "CNH=X", 4),
+        ("USDCNY", "USDCNY=X", 4),
         ("BTCUSD", "BTC-USD", 0),
     ]
     st.markdown(render_price_block("Currencies", fx), unsafe_allow_html=True)
