@@ -101,6 +101,33 @@ def yf_history(ticker: str, period: str = "2y") -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def muni_etf_yield_pct() -> Optional[float]:
+    """MUB's distribution yield as a percent. Computed from trailing 12-month
+    cash dividends divided by the latest close \u2014 avoids the slow
+    yfinance `.info` endpoint and only uses already-cached price history.
+    """
+    try:
+        import yfinance as yf
+
+        tk = yf.Ticker("MUB")
+        # Dividends call is much faster than .info and rarely hangs.
+        divs = tk.dividends
+        hist = yf_history("MUB", period="2y")
+        if divs is None or divs.empty or hist.empty:
+            return None
+        if isinstance(divs.index, pd.DatetimeIndex) and divs.index.tz is not None:
+            divs.index = divs.index.tz_localize(None)
+        cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=365)
+        ttm = float(divs[divs.index >= cutoff].sum())
+        last_price = float(hist["Close"].dropna().iloc[-1])
+        if last_price <= 0 or ttm <= 0:
+            return None
+        return (ttm / last_price) * 100
+    except Exception:
+        return None
+
+
 WSJ_ENTITLEMENT = "cecc4267a0194af89ca343805a3e57af"
 
 
@@ -328,7 +355,73 @@ st.markdown(
 
 tab1, tab2 = st.tabs(["Markets Dashboard", "Beta Calculator"])
 
+
+# ---------- Parallel prefetch ----------
+# Every dashboard cell ultimately calls one of three cached functions:
+# fred_series, wsj_bond_series, or yf_history. By firing them all
+# concurrently up-front, the per-cell render calls become cache hits and
+# the page paints in a fraction of the time it would take serially.
+def _prefetch_dashboard_data() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    today = dt.date.today()
+    fred_with_start = dt.date(today.year - 2, 1, 1)
+
+    # FRED IDs called with the 2-year start (yield-like series rendered
+    # via quote_from_fred -> latest_and_changes_from_series).
+    fred_yields = ["DGS2", "DGS5", "DGS7", "DGS10", "DGS30"]
+    # FRED IDs called with no start (policy + credit single-value reads).
+    fred_levels = [
+        "DFEDTARU", "DFEDTARL", "ECBMRRFR", "IRSTCI01JPM156N",
+        "IUDSOIA", "IR3TIB01CNM156N",
+        "MORTGAGE30US", "DGS10",
+        "BAMLC0A0CMEY", "BAMLC0A0CM",
+        "BAMLH0A0HYM2EY", "BAMLH0A0HYM2",
+    ]
+    wsj_tickers = [
+        "TMBMKDE-02Y", "TMBMKDE-05Y", "TMBMKDE-10Y", "TMBMKDE-30Y",
+        "TMBMKJP-02Y", "TMBMKJP-05Y", "TMBMKJP-10Y", "TMBMKJP-30Y",
+        "TMBMKGB-02Y", "TMBMKGB-05Y", "TMBMKGB-10Y", "TMBMKGB-30Y",
+        "TMBMKIT-10Y",
+    ]
+    yf_tickers = [
+        "^GSPC", "^DJI", "^IXIC", "^RUT",
+        "^STOXX50E", "^N225", "^FTSE", "000001.SS",
+        "^VIX",
+        "AAPL", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "TSLA",
+        "DX-Y.NYB", "EURUSD=X", "JPY=X", "GBPUSD=X", "USDCNY=X", "BTC-USD",
+        "GC=F", "BZ=F", "HG=F", "ZC=F", "NG=F",
+        "MUB",
+    ]
+
+    tasks = []
+    for sid in fred_yields:
+        tasks.append((fred_series, (sid,), {"start": fred_with_start}))
+    for sid in fred_levels:
+        tasks.append((fred_series, (sid,), {}))
+    for tkr in wsj_tickers:
+        tasks.append((wsj_bond_series, (tkr,), {}))
+    for tkr in yf_tickers:
+        tasks.append((yf_history, (tkr,), {"period": "2y"}))
+    tasks.append((muni_etf_yield_pct, (), {}))
+
+    # 16 workers is a good balance — Yahoo and FRED both tolerate it,
+    # and most of the time is spent waiting on network I/O.
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        futures = [ex.submit(fn, *args, **kwargs) for fn, args, kwargs in tasks]
+        for f in futures:
+            try:
+                f.result(timeout=25)
+            except Exception:
+                # Individual failures fall through; the render path will
+                # show "\u2014" for any series that didn't come back.
+                pass
+
+
 with tab1:
+    with st.spinner("Loading market data\u2026"):
+        _prefetch_dashboard_data()
+
     if not FRED_API_KEY:
         st.warning(
             "No FRED API key found. Policy rates, macro indicators, and credit indices "
@@ -476,26 +569,17 @@ with tab1:
             return (ita10.last - de10.last) * 100
 
         # Muni: ICE BofA muni indices were discontinued on FRED. We use the
-        # iShares National Muni ETF (MUB) yield-to-maturity proxy via Yahoo Finance,
-        # which is what most free dashboards use. The SEC 30-day yield from MUB's
-        # info object is a clean industry-standard read.
+        # iShares National Muni ETF (MUB) trailing-12-month distribution yield
+        # as a proxy. Computed from cached dividends + price history so it
+        # avoids the slow yfinance `.info` call.
         def muni_yield_and_spread() -> tuple[Optional[float], Optional[float]]:
-            try:
-                import yfinance as yf
-
-                info = yf.Ticker("MUB").info or {}
-                y = info.get("yield")
-                if y is None:
-                    y = info.get("trailingAnnualDividendYield")
-                yld_pct = float(y) * 100 if y else None
-                spread_bp = (
-                    (yld_pct - dgs10_last) * 100
-                    if (yld_pct is not None and dgs10_last is not None)
-                    else None
-                )
-                return yld_pct, spread_bp
-            except Exception:
-                return None, None
+            yld_pct = muni_etf_yield_pct()
+            spread_bp = (
+                (yld_pct - dgs10_last) * 100
+                if (yld_pct is not None and dgs10_last is not None)
+                else None
+            )
+            return yld_pct, spread_bp
 
         credit_rows = [
             ("Mortgage 30y (Freddie)", "MORTGAGE30US", None, mortgage_spread_bps),
