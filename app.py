@@ -101,6 +101,56 @@ def yf_history(ticker: str, period: str = "2y") -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# Shared cached Yahoo helpers (used by WACC, Comps, Asset Comparison, etc.)
+# These wrap the slow yfinance endpoints so they only get hit once per
+# ticker per cache window.
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def yf_info(ticker: str) -> dict:
+    try:
+        import yfinance as yf
+
+        return dict(yf.Ticker(ticker).info or {})
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def yf_balance_sheet(ticker: str) -> pd.DataFrame:
+    try:
+        import yfinance as yf
+
+        df = yf.Ticker(ticker).balance_sheet
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def yf_income_stmt(ticker: str) -> pd.DataFrame:
+    try:
+        import yfinance as yf
+
+        df = yf.Ticker(ticker).income_stmt
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _bs_get(bs: pd.DataFrame, *keys) -> Optional[float]:
+    """Return the most-recent value of the first matching balance-sheet row."""
+    if bs is None or bs.empty:
+        return None
+    for k in keys:
+        if k in bs.index:
+            try:
+                v = bs.loc[k].dropna()
+                if not v.empty:
+                    return float(v.iloc[0])
+            except Exception:
+                continue
+    return None
+
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def muni_etf_yield_pct() -> Optional[float]:
     """MUB's distribution yield as a percent. Computed from trailing 12-month
@@ -354,7 +404,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2 = st.tabs(["Markets Dashboard", "Beta Calculator"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "Markets Dashboard",
+    "Beta Calculator",
+    "WACC / Cost of Capital",
+    "Trading Comps",
+    "Yield Curves",
+    "Return Comparison",
+    "Economic Calendar",
+])
 
 
 # ---------- Parallel prefetch ----------
@@ -867,6 +925,565 @@ with tab2:
                         display.columns = [f"{beta_ticker} return", f"{beta_benchmark} return"]
                         display.index.name = "Period end"
                         st.dataframe(display.style.format("{:+.2%}"), use_container_width=True)
+
+
+
+# =============================================================================
+# Tab 3: WACC / Cost of Capital
+# =============================================================================
+with tab3:
+    st.markdown("<h1 class='dash-title' style='font-size:18px;'>WACC / Cost of Capital</h1>", unsafe_allow_html=True)
+    st.caption(
+        "Cost of equity via CAPM. After-tax cost of debt from interest expense / total debt. "
+        "WACC = (E/V) \u00d7 Re + (D/V) \u00d7 Rd \u00d7 (1 \u2212 t). Beta is computed from your selected window."
+    )
+
+    wc1, wc2, wc3 = st.columns([1.4, 1, 1])
+    with wc1:
+        wacc_ticker = st.text_input("Ticker", value="AAPL", key="wacc_ticker").strip().upper()
+    with wc2:
+        wacc_window = st.selectbox("Beta window", ["1y", "2y", "3y", "5y"], index=1, key="wacc_window")
+    with wc3:
+        wacc_freq = st.selectbox("Beta frequency", ["Daily", "Weekly", "Monthly"], index=1, key="wacc_freq")
+
+    # Auto-pull current 10Y as a sensible Rf default
+    try:
+        _rf_default = float(quote_from_fred("DGS10").last or 4.5)
+    except Exception:
+        _rf_default = 4.5
+
+    we1, we2, we3 = st.columns(3)
+    with we1:
+        wacc_rf = st.number_input("Risk-free rate (%)", value=round(_rf_default, 2), step=0.05, key="wacc_rf")
+    with we2:
+        wacc_erp = st.number_input("Equity risk premium (%)", value=4.60, step=0.10, key="wacc_erp",
+                                   help="Damodaran's implied US ERP runs ~4.5\u20135.0%.")
+    with we3:
+        wacc_tax = st.number_input("Marginal tax rate (%)", value=21.0, step=0.5, key="wacc_tax")
+
+    run_wacc = st.button("Calculate WACC", type="primary", key="wacc_run")
+
+    if run_wacc:
+        if not wacc_ticker:
+            st.error("Please enter a ticker.")
+        else:
+            with st.spinner(f"Pulling fundamentals for {wacc_ticker}\u2026"):
+                # Beta from the same logic as the Beta tab
+                period_map = {"1y":"1y","2y":"2y","3y":"3y","5y":"5y"}
+                period = period_map[wacc_window]
+                stock_df = yf_history(wacc_ticker, period=period)
+                bench_df = yf_history("^GSPC", period=period)
+                info = yf_info(wacc_ticker)
+                bs = yf_balance_sheet(wacc_ticker)
+                inc = yf_income_stmt(wacc_ticker)
+
+            if stock_df.empty or bench_df.empty:
+                st.error(f"Couldn't pull price history for {wacc_ticker}.")
+            else:
+                def _resample_close(close: pd.Series, freq: str) -> pd.Series:
+                    s = close.dropna().sort_index()
+                    if isinstance(s.index, pd.DatetimeIndex) and s.index.tz is not None:
+                        s.index = s.index.tz_localize(None)
+                    if freq == "Daily":  return s.pct_change().dropna()
+                    if freq == "Weekly": return s.resample("W-FRI").last().pct_change().dropna()
+                    if freq == "Monthly":return s.resample("ME").last().pct_change().dropna()
+                    return s.pct_change().dropna()
+
+                sret = _resample_close(stock_df["Close"], wacc_freq)
+                bret = _resample_close(bench_df["Close"], wacc_freq)
+                joined = pd.concat([sret, bret], axis=1, join="inner").dropna()
+                joined.columns = ["s", "b"]
+                beta_val = joined["s"].cov(joined["b"]) / joined["b"].var() if len(joined) > 5 and joined["b"].var() else None
+
+                # Capital structure (use most recent annual balance sheet)
+                total_debt = _bs_get(bs, "Total Debt", "TotalDebt", "Long Term Debt", "LongTermDebt")
+                if total_debt is None:
+                    ltd = _bs_get(bs, "Long Term Debt", "LongTermDebt") or 0
+                    std = _bs_get(bs, "Current Debt", "Short Long Term Debt", "ShortLongTermDebt") or 0
+                    total_debt = (ltd + std) if (ltd or std) else None
+
+                interest_exp = None
+                if not inc.empty:
+                    for k in ("Interest Expense", "InterestExpense", "Net Interest Income"):
+                        if k in inc.index:
+                            try:
+                                v = inc.loc[k].dropna()
+                                if not v.empty:
+                                    interest_exp = abs(float(v.iloc[0]))
+                                    break
+                            except Exception:
+                                pass
+
+                # Market cap from info, or fallback to shares * price
+                mkt_cap = info.get("marketCap")
+                if not mkt_cap:
+                    sh = info.get("sharesOutstanding")
+                    px = float(stock_df["Close"].dropna().iloc[-1])
+                    mkt_cap = sh * px if sh else None
+
+                # Cost of debt
+                if total_debt and interest_exp:
+                    rd_pct = (interest_exp / total_debt) * 100
+                else:
+                    rd_pct = wacc_rf + 1.5  # spread fallback
+
+                # CAPM
+                re_pct = wacc_rf + (beta_val or 1.0) * wacc_erp
+                tax = wacc_tax / 100
+                rd_at_pct = rd_pct * (1 - tax)
+
+                if mkt_cap and total_debt:
+                    e_w = mkt_cap / (mkt_cap + total_debt)
+                    d_w = total_debt / (mkt_cap + total_debt)
+                elif mkt_cap:
+                    e_w, d_w = 1.0, 0.0
+                else:
+                    e_w, d_w = 0.7, 0.3
+
+                wacc_pct = e_w * re_pct + d_w * rd_at_pct
+
+                st.markdown(f"<div class='sub-header'>{info.get('longName') or wacc_ticker} \u2014 Weighted Average Cost of Capital</div>", unsafe_allow_html=True)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("WACC", f"{wacc_pct:.2f}%" if wacc_pct is not None else "\u2014")
+                m2.metric("Cost of Equity", f"{re_pct:.2f}%")
+                m3.metric("After-Tax Cost of Debt", f"{rd_at_pct:.2f}%")
+                m4.metric("Beta", f"{beta_val:.3f}" if beta_val is not None else "\u2014")
+
+                cap_table = pd.DataFrame({
+                    "Component": ["Equity (Market Cap)", "Total Debt", "Enterprise Value (E+D)"],
+                    "Value ($M)": [
+                        f"{mkt_cap/1e6:,.0f}" if mkt_cap else "\u2014",
+                        f"{total_debt/1e6:,.0f}" if total_debt else "\u2014",
+                        f"{(mkt_cap + total_debt)/1e6:,.0f}" if (mkt_cap and total_debt) else "\u2014",
+                    ],
+                    "Weight": [f"{e_w:.1%}", f"{d_w:.1%}", "100.0%"],
+                })
+                st.dataframe(cap_table, use_container_width=True, hide_index=True)
+
+                # Sensitivity table: WACC across beta and ERP
+                st.markdown("<div class='sub-header'>Sensitivity \u2014 WACC at varying Beta and ERP</div>", unsafe_allow_html=True)
+                betas = [(beta_val or 1.0) + d for d in (-0.2, -0.1, 0.0, 0.1, 0.2)]
+                erps = [wacc_erp + d for d in (-1.0, -0.5, 0.0, 0.5, 1.0)]
+                grid = []
+                for b in betas:
+                    row = []
+                    for e in erps:
+                        re_i = wacc_rf + b * e
+                        wacc_i = e_w * re_i + d_w * rd_at_pct
+                        row.append(f"{wacc_i:.2f}%")
+                    grid.append(row)
+                sens = pd.DataFrame(grid, index=[f"\u03b2 {b:.2f}" for b in betas],
+                                    columns=[f"ERP {e:.1f}%" for e in erps])
+                st.dataframe(sens, use_container_width=True)
+
+                with st.expander("Assumptions used"):
+                    st.write(f"- Beta: {beta_val:.3f} ({wacc_window} of {wacc_freq.lower()} returns vs. ^GSPC)" if beta_val is not None else "- Beta: not computable")
+                    st.write(f"- Risk-free rate: {wacc_rf:.2f}% (default seeded from US 10Y)")
+                    st.write(f"- ERP: {wacc_erp:.2f}%")
+                    st.write(f"- Pre-tax cost of debt: {rd_pct:.2f}% " + ("(interest expense / total debt)" if (total_debt and interest_exp) else "(fallback: Rf + 1.5%)"))
+                    st.write(f"- Tax rate: {wacc_tax:.1f}%")
+
+
+# =============================================================================
+# Tab 4: Trading Comps / Multiples Table
+# =============================================================================
+with tab4:
+    st.markdown("<h1 class='dash-title' style='font-size:18px;'>Trading Comps</h1>", unsafe_allow_html=True)
+    st.caption(
+        "Quick relative-value table. Enter a primary ticker and 1\u20139 peers (comma-separated). "
+        "All multiples come from Yahoo Finance fundamentals."
+    )
+
+    cm1, cm2 = st.columns([1, 2.5])
+    with cm1:
+        comp_primary = st.text_input("Primary ticker", value="AAPL", key="comp_primary").strip().upper()
+    with cm2:
+        comp_peers_raw = st.text_input(
+            "Peer tickers (comma-separated)",
+            value="MSFT, GOOGL, META, AMZN, NVDA",
+            key="comp_peers",
+        )
+
+    run_comps = st.button("Build comps table", type="primary", key="comp_run")
+
+    if run_comps:
+        peers = [p.strip().upper() for p in comp_peers_raw.split(",") if p.strip()]
+        all_tickers = [comp_primary] + [p for p in peers if p != comp_primary]
+        if not comp_primary:
+            st.error("Please enter a primary ticker.")
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with st.spinner(f"Pulling fundamentals for {len(all_tickers)} tickers\u2026"):
+                with ThreadPoolExecutor(max_workers=10) as ex:
+                    infos = list(ex.map(yf_info, all_tickers))
+
+            rows = []
+            for tkr, info in zip(all_tickers, infos):
+                if not info:
+                    rows.append({"Ticker": tkr, "Name": "(no data)", "Price": None, "Market Cap": None,
+                                 "EV": None, "EV/Rev": None, "EV/EBITDA": None,
+                                 "P/E (LTM)": None, "P/E (NTM)": None, "P/S": None,
+                                 "P/B": None, "Net Debt/EBITDA": None})
+                    continue
+
+                mcap = info.get("marketCap")
+                ev = info.get("enterpriseValue")
+                rev = info.get("totalRevenue")
+                ebitda = info.get("ebitda")
+                td = info.get("totalDebt") or 0
+                cash = info.get("totalCash") or 0
+                net_debt = td - cash
+                price = info.get("currentPrice") or info.get("regularMarketPrice")
+
+                rows.append({
+                    "Ticker": tkr,
+                    "Name": (info.get("shortName") or info.get("longName") or "")[:32],
+                    "Price": price,
+                    "Market Cap ($M)": mcap/1e6 if mcap else None,
+                    "EV ($M)": ev/1e6 if ev else None,
+                    "EV/Rev": (ev/rev) if (ev and rev) else None,
+                    "EV/EBITDA": (ev/ebitda) if (ev and ebitda) else None,
+                    "P/E (LTM)": info.get("trailingPE"),
+                    "P/E (NTM)": info.get("forwardPE"),
+                    "P/S": info.get("priceToSalesTrailing12Months"),
+                    "P/B": info.get("priceToBook"),
+                    "Net Debt/EBITDA": (net_debt/ebitda) if ebitda else None,
+                })
+
+            df = pd.DataFrame(rows)
+
+            # Add median / mean rows on numeric columns
+            numeric_cols = [c for c in df.columns if c not in ("Ticker", "Name") and pd.api.types.is_numeric_dtype(df[c])]
+            peer_only = df[df["Ticker"] != comp_primary]
+            summary_med = {"Ticker": "Peer Median", "Name": ""}
+            summary_avg = {"Ticker": "Peer Mean",   "Name": ""}
+            for c in numeric_cols:
+                summary_med[c] = peer_only[c].median()
+                summary_avg[c] = peer_only[c].mean()
+            df_full = pd.concat([df, pd.DataFrame([summary_med, summary_avg])], ignore_index=True)
+
+            # Pretty formatting
+            fmt = {}
+            for c in ("Price",):
+                if c in df_full: fmt[c] = "{:,.2f}"
+            for c in ("Market Cap ($M)", "EV ($M)"):
+                if c in df_full: fmt[c] = "{:,.0f}"
+            for c in ("EV/Rev", "EV/EBITDA", "P/E (LTM)", "P/E (NTM)", "P/S", "P/B", "Net Debt/EBITDA"):
+                if c in df_full: fmt[c] = "{:,.2f}x" if "x" not in c else "{:,.2f}"
+            # Use plain format for ratios; "x" suffix is in the column header convention only
+            fmt = {k: "{:,.2f}" for k in fmt} if False else fmt
+            try:
+                styled = df_full.style.format(fmt, na_rep="\u2014")
+                # Highlight primary row
+                def _highlight_primary(row):
+                    return ["background-color: #e8f0fe; font-weight: 600" if row["Ticker"] == comp_primary else "" for _ in row]
+                styled = styled.apply(_highlight_primary, axis=1)
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+            except Exception:
+                st.dataframe(df_full, use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# Tab 5: Yield Curve Visualizer
+# =============================================================================
+with tab5:
+    st.markdown("<h1 class='dash-title' style='font-size:18px;'>Yield Curves</h1>", unsafe_allow_html=True)
+    st.caption("Sovereign curves built from the same data as the Markets Dashboard tab. No extra calls \u2014 fully cached.")
+
+    yc_country = st.selectbox(
+        "Country",
+        ["United States", "Germany", "Japan", "United Kingdom", "All"],
+        index=0,
+        key="yc_country",
+    )
+    yc_overlay = st.selectbox(
+        "Overlay",
+        ["Today only", "Today vs. 1 month ago", "Today vs. 1 year ago", "Today, 1m, 1y"],
+        index=3,
+        key="yc_overlay",
+    )
+
+    # Series IDs per tenor and country
+    CURVES = {
+        "United States": {"2Y":"DGS2", "5Y":"DGS5", "10Y":"DGS10", "30Y":"DGS30"},
+        "Germany":       {"2Y":"TMBMKDE-02Y", "5Y":"TMBMKDE-05Y", "10Y":"TMBMKDE-10Y", "30Y":"TMBMKDE-30Y"},
+        "Japan":         {"2Y":"TMBMKJP-02Y", "5Y":"TMBMKJP-05Y", "10Y":"TMBMKJP-10Y", "30Y":"TMBMKJP-30Y"},
+        "United Kingdom":{"2Y":"TMBMKGB-02Y", "5Y":"TMBMKGB-05Y", "10Y":"TMBMKGB-10Y", "30Y":"TMBMKGB-30Y"},
+    }
+    TENOR_YEARS = {"2Y": 2, "5Y": 5, "10Y": 10, "30Y": 30}
+
+    def _curve_value_at(country: str, tenor: str, asof: pd.Timestamp) -> Optional[float]:
+        sid = CURVES[country][tenor]
+        if sid.startswith("TMBMK"):
+            s = wsj_bond_series(sid)
+        else:
+            s = fred_series(sid, start=dt.date(asof.year - 2, 1, 1))
+        if s is None or s.empty:
+            return None
+        if isinstance(s.index, pd.DatetimeIndex) and s.index.tz is not None:
+            s.index = s.index.tz_localize(None)
+        s = s.dropna()
+        if s.empty:
+            return None
+        # Take the most recent observation at or before asof
+        idx = s.index[s.index <= asof]
+        if len(idx) == 0:
+            return float(s.iloc[0])
+        return float(s.loc[idx[-1]])
+
+    today = pd.Timestamp.today().normalize()
+    overlays = []
+    if yc_overlay in ("Today only", "Today vs. 1 month ago", "Today vs. 1 year ago", "Today, 1m, 1y"):
+        overlays.append(("Today", today))
+    if yc_overlay in ("Today vs. 1 month ago", "Today, 1m, 1y"):
+        overlays.append(("1 month ago", today - pd.DateOffset(months=1)))
+    if yc_overlay in ("Today vs. 1 year ago", "Today, 1m, 1y"):
+        overlays.append(("1 year ago", today - pd.DateOffset(years=1)))
+
+    countries = list(CURVES.keys()) if yc_country == "All" else [yc_country]
+
+    rows = []
+    for c in countries:
+        for label, ts in overlays:
+            for tenor, _sid in CURVES[c].items():
+                v = _curve_value_at(c, tenor, ts)
+                rows.append({"Country": c, "Snapshot": label, "Tenor": tenor,
+                             "Years": TENOR_YEARS[tenor], "Yield": v})
+
+    plot_df = pd.DataFrame(rows).dropna(subset=["Yield"])
+    if plot_df.empty:
+        st.info("No curve data available.")
+    else:
+        try:
+            import altair as alt
+            color_field = "Country:N" if yc_country == "All" else "Snapshot:N"
+            stroke_field = "Snapshot:N" if yc_country == "All" else "Country:N"
+            chart = (
+                alt.Chart(plot_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("Years:Q", title="Maturity (years)", scale=alt.Scale(type="log", domain=[1.5, 35])),
+                    y=alt.Y("Yield:Q", title="Yield (%)"),
+                    color=alt.Color(color_field, legend=alt.Legend(title=None)),
+                    strokeDash=alt.StrokeDash(stroke_field, legend=alt.Legend(title=None)) if yc_country == "All" or len(overlays) > 1 else alt.value([1, 0]),
+                    tooltip=["Country", "Snapshot", "Tenor",
+                             alt.Tooltip("Yield:Q", format=".2f")],
+                )
+                .properties(height=420)
+            )
+            st.altair_chart(chart, use_container_width=True)
+        except Exception:
+            st.line_chart(plot_df.pivot_table(index="Years", columns=["Country","Snapshot"], values="Yield"))
+
+        with st.expander("Show snapshot data"):
+            piv = plot_df.pivot_table(
+                index=["Country", "Tenor"], columns="Snapshot", values="Yield"
+            ).round(3)
+            # Reorder tenors
+            piv = piv.reindex(["2Y","5Y","10Y","30Y"], level="Tenor")
+            st.dataframe(piv, use_container_width=True)
+
+
+# =============================================================================
+# Tab 6: Multi-Asset Return Comparison
+# =============================================================================
+with tab6:
+    st.markdown("<h1 class='dash-title' style='font-size:18px;'>Return Comparison</h1>", unsafe_allow_html=True)
+    st.caption(
+        "Enter 2\u201310 tickers. Prices are rebased to 100 at the start. Stats use daily returns."
+    )
+
+    rc1, rc2 = st.columns([3, 1])
+    with rc1:
+        rc_tickers_raw = st.text_input(
+            "Tickers (comma-separated)",
+            value="^GSPC, ^NDX, AAPL, NVDA, GLD",
+            key="rc_tickers",
+        )
+    with rc2:
+        rc_period = st.selectbox(
+            "Window",
+            ["3mo", "6mo", "1y", "2y", "3y", "5y", "10y", "ytd"],
+            index=2,
+            key="rc_period",
+        )
+
+    run_rc = st.button("Compare", type="primary", key="rc_run")
+
+    if run_rc:
+        tickers = [t.strip().upper() for t in rc_tickers_raw.split(",") if t.strip()][:10]
+        if len(tickers) < 1:
+            st.error("Enter at least one ticker.")
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            period_for_yf = "10y" if rc_period == "ytd" else rc_period
+            with st.spinner(f"Pulling history for {len(tickers)} tickers\u2026"):
+                with ThreadPoolExecutor(max_workers=10) as ex:
+                    histories = list(ex.map(lambda t: yf_history(t, period=period_for_yf), tickers))
+
+            closes = {}
+            for t, h in zip(tickers, histories):
+                if h is None or h.empty:
+                    continue
+                s = h["Close"].dropna().copy()
+                if isinstance(s.index, pd.DatetimeIndex) and s.index.tz is not None:
+                    s.index = s.index.tz_localize(None)
+                closes[t] = s
+
+            if not closes:
+                st.error("No data returned for any of the tickers.")
+            else:
+                px = pd.DataFrame(closes).dropna(how="all")
+                if rc_period == "ytd":
+                    px = px[px.index >= pd.Timestamp(dt.date(dt.date.today().year, 1, 1))]
+                px = px.dropna(how="all").ffill()
+
+                # Rebase to 100 at first valid value per column
+                rebased = px.apply(lambda c: c / c.dropna().iloc[0] * 100 if c.dropna().size else c)
+
+                try:
+                    import altair as alt
+                    plot_df = rebased.reset_index().melt("Date" if "Date" in rebased.reset_index().columns else rebased.reset_index().columns[0],
+                                                          var_name="Ticker", value_name="Index").dropna()
+                    date_col = plot_df.columns[0]
+                    chart = (
+                        alt.Chart(plot_df)
+                        .mark_line()
+                        .encode(
+                            x=alt.X(f"{date_col}:T", title=None),
+                            y=alt.Y("Index:Q", title="Rebased to 100"),
+                            color=alt.Color("Ticker:N", legend=alt.Legend(title=None)),
+                            tooltip=[alt.Tooltip(f"{date_col}:T", title="Date"),
+                                     "Ticker",
+                                     alt.Tooltip("Index:Q", format=",.2f")],
+                        )
+                        .properties(height=420)
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+                except Exception:
+                    st.line_chart(rebased)
+
+                # Stats table
+                rets = px.pct_change().dropna(how="all")
+                stats = []
+                for t in px.columns:
+                    s = px[t].dropna()
+                    r = rets[t].dropna()
+                    if s.empty or r.empty:
+                        continue
+                    total = s.iloc[-1] / s.iloc[0] - 1
+                    days = (s.index[-1] - s.index[0]).days
+                    ann_ret = (s.iloc[-1] / s.iloc[0]) ** (365 / max(days, 1)) - 1 if days > 0 else None
+                    ann_vol = r.std() * (252 ** 0.5)
+                    sharpe = (ann_ret / ann_vol) if (ann_ret is not None and ann_vol) else None
+                    # Max drawdown
+                    cummax = s.cummax()
+                    dd = (s / cummax - 1).min()
+                    stats.append({
+                        "Ticker": t,
+                        "Total Return": f"{total:+.2%}",
+                        "Annualized Return": f"{ann_ret:+.2%}" if ann_ret is not None else "\u2014",
+                        "Annualized Vol": f"{ann_vol:.2%}",
+                        "Max Drawdown": f"{dd:.2%}",
+                        "Sharpe (Rf=0)": f"{sharpe:.2f}" if sharpe is not None else "\u2014",
+                    })
+                st.markdown("<div class='sub-header'>Performance Statistics</div>", unsafe_allow_html=True)
+                st.dataframe(pd.DataFrame(stats), use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# Tab 7: Economic Calendar
+# =============================================================================
+with tab7:
+    st.markdown("<h1 class='dash-title' style='font-size:18px;'>Economic Calendar</h1>", unsafe_allow_html=True)
+    st.caption(
+        "Upcoming Federal Reserve and ECB policy meetings, plus monthly US data releases. "
+        "Fed/ECB dates are scheduled; CPI/NFP/GDP/PCE are released on regular monthly cadences."
+    )
+
+    @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)  # 24h cache \u2014 these don't move
+    def _econ_events(today: dt.date) -> pd.DataFrame:
+        events = []
+
+        # FOMC 2026 (publicly announced schedule)
+        fomc_2026 = [
+            ("Jan 27\u201328, 2026", dt.date(2026, 1, 28)),
+            ("Mar 17\u201318, 2026", dt.date(2026, 3, 18)),
+            ("Apr 28\u201329, 2026", dt.date(2026, 4, 29)),
+            ("Jun 16\u201317, 2026", dt.date(2026, 6, 17)),
+            ("Jul 28\u201329, 2026", dt.date(2026, 7, 29)),
+            ("Sep 15\u201316, 2026", dt.date(2026, 9, 16)),
+            ("Nov 3\u20134, 2026",   dt.date(2026, 11, 4)),
+            ("Dec 15\u201316, 2026", dt.date(2026, 12, 16)),
+        ]
+        for label, d in fomc_2026:
+            events.append({"Date": d, "Event": "FOMC Decision", "Region": "US",
+                           "Detail": f"Two-day meeting ({label}) \u2014 statement and SEP if applicable"})
+
+        # ECB Governing Council 2026 monetary policy meetings
+        ecb_2026 = [
+            dt.date(2026, 1, 22), dt.date(2026, 3, 12), dt.date(2026, 4, 30),
+            dt.date(2026, 6, 11), dt.date(2026, 7, 23), dt.date(2026, 9, 10),
+            dt.date(2026, 10, 29), dt.date(2026, 12, 17),
+        ]
+        for d in ecb_2026:
+            events.append({"Date": d, "Event": "ECB Decision", "Region": "Euro Area",
+                           "Detail": "Governing Council monetary policy meeting"})
+
+        # Generate next ~6 monthly US releases from typical BLS/BEA cadences
+        # (CPI: ~10\u201315 of next month; NFP: 1st Friday; GDP: ~end of month; PCE: ~end of month)
+        def _first_friday(year: int, month: int) -> dt.date:
+            d = dt.date(year, month, 1)
+            offset = (4 - d.weekday()) % 7  # Mon=0 ... Fri=4
+            return d + dt.timedelta(days=offset)
+
+            # CPI typically releases ~12th business day; we use 13th as a stable approximation
+        for i in range(0, 6):
+            month_anchor = today.replace(day=1)
+            # Move forward by i months
+            year = month_anchor.year + (month_anchor.month - 1 + i) // 12
+            month = (month_anchor.month - 1 + i) % 12 + 1
+
+            cpi_date = dt.date(year, month, 13)
+            events.append({"Date": cpi_date, "Event": "US CPI", "Region": "US",
+                           "Detail": "Bureau of Labor Statistics release (typical mid-month)"})
+            nfp_date = _first_friday(year, month)
+            events.append({"Date": nfp_date, "Event": "US Nonfarm Payrolls", "Region": "US",
+                           "Detail": "BLS Employment Situation report"})
+            # PCE \u2014 typically last Friday of the month
+            last_day = (dt.date(year, month, 28) + dt.timedelta(days=4)).replace(day=1) - dt.timedelta(days=1)
+            offset = (last_day.weekday() - 4) % 7
+            pce_date = last_day - dt.timedelta(days=offset)
+            events.append({"Date": pce_date, "Event": "US PCE Inflation", "Region": "US",
+                           "Detail": "BEA Personal Income and Outlays release"})
+
+        df = pd.DataFrame(events)
+        df = df[df["Date"] >= today].sort_values("Date").reset_index(drop=True)
+        return df
+
+    cal_df = _econ_events(dt.date.today())
+
+    if cal_df.empty:
+        st.info("No upcoming events on file.")
+    else:
+        ec1, ec2 = st.columns([1, 1])
+        with ec1:
+            region_filter = st.multiselect("Filter by region", sorted(cal_df["Region"].unique()),
+                                           default=sorted(cal_df["Region"].unique()), key="ec_region")
+        with ec2:
+            event_filter = st.multiselect("Filter by event", sorted(cal_df["Event"].unique()),
+                                          default=sorted(cal_df["Event"].unique()), key="ec_event")
+
+        filtered = cal_df[cal_df["Region"].isin(region_filter) & cal_df["Event"].isin(event_filter)].head(40).copy()
+        filtered["Date"] = pd.to_datetime(filtered["Date"]).dt.strftime("%a %b %d, %Y")
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "FOMC and ECB dates from official 2026 schedules (federalreserve.gov, ecb.europa.eu). "
+            "Monthly data release dates are estimated from typical release cadences and can shift by a few days; "
+            "always confirm with the issuing agency before trading."
+        )
+
 
 
 
