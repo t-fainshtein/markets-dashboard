@@ -700,8 +700,9 @@ with tab2:
             st.error("Please enter both a stock ticker and a benchmark.")
         else:
             period = _yf_period_for(beta_timeframe)
-            stock_df = yf_history(beta_ticker, period=period)
-            bench_df = yf_history(beta_benchmark, period=period)
+            with st.spinner(f"Fetching {period} of price history for {beta_ticker} and {beta_benchmark}\u2026"):
+                stock_df = yf_history(beta_ticker, period=period)
+                bench_df = yf_history(beta_benchmark, period=period)
 
             if stock_df.empty:
                 st.error(f"No price data found for **{beta_ticker}**. Double-check the ticker.")
@@ -733,17 +734,10 @@ with tab2:
                     periods_per_year = {"Daily": 252, "Weekly": 52, "Monthly": 12, "Quarterly": 4}.get(beta_frequency, 252)
                     alpha_annual_pct = alpha * periods_per_year * 100 if alpha is not None else None
 
-                    # Try to fetch the company name (don't fail if Yahoo blocks .info)
-                    company_name = beta_ticker
-                    try:
-                        import yfinance as yf
-                        info = yf.Ticker(beta_ticker).info or {}
-                        company_name = info.get("longName") or info.get("shortName") or beta_ticker
-                    except Exception:
-                        pass
-
+                    # We deliberately skip the slow yfinance .info company-name lookup —
+                    # that endpoint can take 10\u201330s and was the cause of long loads.
                     st.markdown(
-                        f"<div class='sub-header'>{company_name} &nbsp;vs&nbsp; {beta_benchmark} &nbsp;|&nbsp; "
+                        f"<div class='sub-header'>{beta_ticker} &nbsp;vs&nbsp; {beta_benchmark} &nbsp;|&nbsp; "
                         f"{beta_timeframe} of {beta_frequency.lower()} returns</div>",
                         unsafe_allow_html=True,
                     )
@@ -795,7 +789,7 @@ with tab2:
 # Footer
 # =============================================================================
 st.markdown(
-    f"<div class='footer'>Sources: FRED, Stooq, Yahoo Finance. "
+    f"<div class='footer'>Sources: FRED, WSJ/MarketWatch, Yahoo Finance. "
     f"Data refreshed every 10 minutes (cached). "
     f"Generated {dt.datetime.now().strftime('%Y-%m-%d %H:%M')} local time.</div>",
     unsafe_allow_html=True,
