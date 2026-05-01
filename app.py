@@ -1063,6 +1063,17 @@ with tab3:
             help="Pick the issuer-level long-term rating from Moody's / S&P / Fitch.",
         )
 
+    debt_maturity = st.number_input(
+        "Weighted-average debt maturity (years)",
+        min_value=0.5, max_value=40.0, value=5.0, step=0.5,
+        key="wacc_debt_maturity",
+        help=(
+            "Used in the market-value-of-debt calculation. The 5-year default is Damodaran's "
+            "convention. For utilities/telecoms/railroads, override to ~10\u201315y. For banks/REITs, "
+            "~2\u20133y. Look up the actual weighted-average in the long-term-debt footnote of the 10-K."
+        ),
+    )
+
     st.markdown("<div class='sub-header'>Preferred Stock (optional)</div>", unsafe_allow_html=True)
     has_pref = st.checkbox("Company has preferred stock outstanding", value=False, key="wacc_has_pref")
     if has_pref:
@@ -1198,8 +1209,8 @@ with tab3:
 
                 debt_is_market = bool(book_debt and interest_exp and pre_tax_rd)
                 if debt_is_market:
-                    debt_value = _market_value_of_debt(book_debt, interest_exp, pre_tax_rd)
-                    debt_label = "Market Value (Damodaran coupon-bond approx, 5y)"
+                    debt_value = _market_value_of_debt(book_debt, interest_exp, pre_tax_rd, maturity_yrs=debt_maturity)
+                    debt_label = f"Market Value (Damodaran coupon-bond approx, {debt_maturity:g}y)"
                 else:
                     debt_value = book_debt or 0
                     debt_label = "Book Value (fallback)" if book_debt else "None reported"
@@ -1299,7 +1310,7 @@ with tab3:
                     f"- **Debt value:** {debt_label}. "
                     + ("Market value estimated using Damodaran's coupon-bond approximation: "
                        "the outstanding book debt is treated as a single bullet bond paying the company's reported interest expense as coupon, "
-                       "discounted at the pre-tax cost of debt over an assumed 5-year maturity."
+                       f"discounted at the pre-tax cost of debt over an assumed {debt_maturity:g}-year maturity."
                        if debt_is_market else
                        "Not enough fundamentals to convert to market value, so the book balance-sheet amount is used directly. "
                        "For most investment-grade issuers book and market are close, so the WACC impact is small.")
