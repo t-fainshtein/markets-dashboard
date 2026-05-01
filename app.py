@@ -931,11 +931,74 @@ with tab2:
 # =============================================================================
 # Tab 3: WACC / Cost of Capital
 # =============================================================================
+
+# --- Damodaran synthetic credit rating tables ----------------------------------
+# Source: Aswath Damodaran, NYU Stern, "Ratings, Interest Coverage Ratios and
+# Default Spread" (updated annually at pages.stern.nyu.edu/~adamodar/).
+# Default spreads below are in percentage points over the risk-free rate and
+# reflect Damodaran's January 2025 update for US non-financial firms.
+# When Damodaran refreshes these tables, update the numbers here.
+#
+# ICR thresholds differ for "large" (market cap > $5B) vs. "small/risky" firms.
+DAMODARAN_ICR_LARGE = [
+    # (min_ICR, max_ICR, rating, default_spread_pct)
+    (8.50,  float("inf"), "Aaa/AAA", 0.59),
+    (6.50,  8.50,         "Aa2/AA",  0.78),
+    (5.50,  6.50,         "A1/A+",   1.03),
+    (4.25,  5.50,         "A2/A",    1.14),
+    (3.00,  4.25,         "A3/A-",   1.30),
+    (2.50,  3.00,         "Baa2/BBB",1.62),
+    (2.25,  2.50,         "Ba1/BB+", 2.38),
+    (2.00,  2.25,         "Ba2/BB",  2.78),
+    (1.75,  2.00,         "B1/B+",   3.57),
+    (1.50,  1.75,         "B2/B",    4.37),
+    (1.25,  1.50,         "B3/B-",   5.26),
+    (0.80,  1.25,         "Caa/CCC", 8.00),
+    (0.65,  0.80,         "Ca2/CC", 10.50),
+    (0.20,  0.65,         "C2/C",   14.00),
+    (float("-inf"), 0.20, "D2/D",   19.50),
+]
+DAMODARAN_ICR_SMALL = [
+    (12.5,  float("inf"), "Aaa/AAA", 0.59),
+    (9.50,  12.5,         "Aa2/AA",  0.78),
+    (7.50,  9.50,         "A1/A+",   1.03),
+    (6.00,  7.50,         "A2/A",    1.14),
+    (4.50,  6.00,         "A3/A-",   1.30),
+    (4.00,  4.50,         "Baa2/BBB",1.62),
+    (3.50,  4.00,         "Ba1/BB+", 2.38),
+    (3.00,  3.50,         "Ba2/BB",  2.78),
+    (2.50,  3.00,         "B1/B+",   3.57),
+    (2.00,  2.50,         "B2/B",    4.37),
+    (1.50,  2.00,         "B3/B-",   5.26),
+    (1.25,  1.50,         "Caa/CCC", 8.00),
+    (0.80,  1.25,         "Ca2/CC", 10.50),
+    (0.50,  0.80,         "C2/C",   14.00),
+    (float("-inf"), 0.50, "D2/D",   19.50),
+]
+# Rating -> default spread, used when the user picks a rating directly.
+DAMODARAN_RATING_SPREADS = {
+    "Aaa/AAA": 0.59, "Aa2/AA": 0.78, "A1/A+": 1.03, "A2/A": 1.14, "A3/A-": 1.30,
+    "Baa2/BBB": 1.62, "Ba1/BB+": 2.38, "Ba2/BB": 2.78, "B1/B+": 3.57,
+    "B2/B": 4.37, "B3/B-": 5.26, "Caa/CCC": 8.00, "Ca2/CC": 10.50,
+    "C2/C": 14.00, "D2/D": 19.50,
+}
+
+def _synthetic_rating(icr: float, is_large: bool) -> tuple[str, float]:
+    table = DAMODARAN_ICR_LARGE if is_large else DAMODARAN_ICR_SMALL
+    for lo, hi, rating, spread in table:
+        if lo <= icr < hi:
+            return rating, spread
+    # Falls through only if icr is NaN
+    return "B2/B", 4.37
+
+
 with tab3:
     st.markdown("<h1 class='dash-title' style='font-size:18px;'>WACC / Cost of Capital</h1>", unsafe_allow_html=True)
     st.caption(
-        "Cost of equity via CAPM. After-tax cost of debt from interest expense / total debt. "
-        "WACC = (E/V) \u00d7 Re + (D/V) \u00d7 Rd \u00d7 (1 \u2212 t). Beta is computed from your selected window."
+        "WACC = (E/V) \u00d7 Re + (P/V) \u00d7 Rp + (D/V) \u00d7 Rd \u00d7 (1 \u2212 t). "
+        "Equity, preferred, and debt use market values where available, with labeled book-value fallbacks. "
+        "Cost of debt supports three methodologies: observed YTM, actual credit rating (Damodaran spread), "
+        "or a synthetic rating from Damodaran's ICR-to-default-spread table."
     )
 
     wc1, wc2, wc3 = st.columns([1.4, 1, 1])
@@ -952,7 +1015,7 @@ with tab3:
     except Exception:
         _rf_default = 4.5
 
-    we1, we2, we3 = st.columns(3)
+    we1, we2, we3, we4 = st.columns(4)
     with we1:
         wacc_rf = st.number_input("Risk-free rate (%)", value=round(_rf_default, 2), step=0.05, key="wacc_rf")
     with we2:
@@ -960,6 +1023,56 @@ with tab3:
                                    help="Damodaran's implied US ERP runs ~4.5\u20135.0%.")
     with we3:
         wacc_tax = st.number_input("Marginal tax rate (%)", value=21.0, step=0.5, key="wacc_tax")
+    with we4:
+        beta_flavor = st.selectbox(
+            "Beta adjustment",
+            ["Raw (regression)", "Bloomberg-adjusted"],
+            index=1,
+            key="wacc_beta_flavor",
+            help="Bloomberg-adjusted = 0.67 \u00d7 raw + 0.33 (Blume's mean-reversion formula).",
+        )
+
+    st.markdown("<div class='sub-header'>Cost of Debt Methodology</div>", unsafe_allow_html=True)
+    method = st.radio(
+        "How should we estimate the cost of debt?",
+        [
+            "Observed YTM (publicly traded debt)",
+            "Actual credit rating (Damodaran spread)",
+            "Synthetic rating from ICR (EBIT / Interest Expense)",
+        ],
+        index=2,
+        key="wacc_method",
+        horizontal=False,
+    )
+
+    rating_options = list(DAMODARAN_RATING_SPREADS.keys())
+
+    if method == "Observed YTM (publicly traded debt)":
+        ytm_input = st.number_input(
+            "Yield-to-maturity on the company's outstanding debt (%)",
+            value=round(_rf_default + 1.5, 2), step=0.05, key="wacc_ytm",
+            help="Enter the weighted-average YTM across the issuer's outstanding bonds. "
+                 "Use the longest liquid benchmark or duration-weighted average.",
+        )
+    elif method == "Actual credit rating (Damodaran spread)":
+        chosen_rating = st.selectbox(
+            "Issuer credit rating",
+            rating_options,
+            index=rating_options.index("Baa2/BBB"),
+            key="wacc_rating",
+            help="Pick the issuer-level long-term rating from Moody's / S&P / Fitch.",
+        )
+
+    st.markdown("<div class='sub-header'>Preferred Stock (optional)</div>", unsafe_allow_html=True)
+    has_pref = st.checkbox("Company has preferred stock outstanding", value=False, key="wacc_has_pref")
+    if has_pref:
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            pref_div_ps = st.number_input("Preferred dividend per share ($)", value=0.00, step=0.05, key="wacc_pref_div")
+        with p2:
+            pref_price = st.number_input("Preferred market price ($)", value=0.00, step=0.50, key="wacc_pref_px")
+        with p3:
+            pref_shares = st.number_input("Preferred shares outstanding (M)", value=0.0, step=0.1, key="wacc_pref_sh")
 
     run_wacc = st.button("Calculate WACC", type="primary", key="wacc_run")
 
@@ -968,7 +1081,6 @@ with tab3:
             st.error("Please enter a ticker.")
         else:
             with st.spinner(f"Pulling fundamentals for {wacc_ticker}\u2026"):
-                # Beta from the same logic as the Beta tab
                 period_map = {"1y":"1y","2y":"2y","3y":"3y","5y":"5y"}
                 period = period_map[wacc_window]
                 stock_df = yf_history(wacc_ticker, period=period)
@@ -980,6 +1092,7 @@ with tab3:
             if stock_df.empty or bench_df.empty:
                 st.error(f"Couldn't pull price history for {wacc_ticker}.")
             else:
+                # ---- Beta (raw + Bloomberg-adjusted) ----
                 def _resample_close(close: pd.Series, freq: str) -> pd.Series:
                     s = close.dropna().sort_index()
                     if isinstance(s.index, pd.DatetimeIndex) and s.index.tz is not None:
@@ -993,18 +1106,18 @@ with tab3:
                 bret = _resample_close(bench_df["Close"], wacc_freq)
                 joined = pd.concat([sret, bret], axis=1, join="inner").dropna()
                 joined.columns = ["s", "b"]
-                beta_val = joined["s"].cov(joined["b"]) / joined["b"].var() if len(joined) > 5 and joined["b"].var() else None
+                raw_beta = joined["s"].cov(joined["b"]) / joined["b"].var() if (len(joined) > 5 and joined["b"].var()) else None
+                if raw_beta is not None:
+                    bloom_beta = 0.67 * raw_beta + 0.33
+                else:
+                    bloom_beta = None
+                beta_val = bloom_beta if beta_flavor == "Bloomberg-adjusted" else raw_beta
 
-                # Capital structure (use most recent annual balance sheet)
-                total_debt = _bs_get(bs, "Total Debt", "TotalDebt", "Long Term Debt", "LongTermDebt")
-                if total_debt is None:
-                    ltd = _bs_get(bs, "Long Term Debt", "LongTermDebt") or 0
-                    std = _bs_get(bs, "Current Debt", "Short Long Term Debt", "ShortLongTermDebt") or 0
-                    total_debt = (ltd + std) if (ltd or std) else None
-
+                # ---- Fundamentals ----
                 interest_exp = None
+                ebit = None
                 if not inc.empty:
-                    for k in ("Interest Expense", "InterestExpense", "Net Interest Income"):
+                    for k in ("Interest Expense", "InterestExpense"):
                         if k in inc.index:
                             try:
                                 v = inc.loc[k].dropna()
@@ -1013,75 +1126,237 @@ with tab3:
                                     break
                             except Exception:
                                 pass
+                    for k in ("EBIT", "Operating Income", "OperatingIncome"):
+                        if k in inc.index:
+                            try:
+                                v = inc.loc[k].dropna()
+                                if not v.empty:
+                                    ebit = float(v.iloc[0])
+                                    break
+                            except Exception:
+                                pass
 
-                # Market cap from info, or fallback to shares * price
+                # Book debt
+                book_debt = _bs_get(bs, "Total Debt", "TotalDebt")
+                if book_debt is None:
+                    ltd = _bs_get(bs, "Long Term Debt", "LongTermDebt") or 0
+                    std = _bs_get(bs, "Current Debt", "Short Long Term Debt", "ShortLongTermDebt") or 0
+                    book_debt = (ltd + std) if (ltd or std) else None
+
+                # ---- Market value of equity ----
                 mkt_cap = info.get("marketCap")
                 if not mkt_cap:
                     sh = info.get("sharesOutstanding")
-                    px = float(stock_df["Close"].dropna().iloc[-1])
-                    mkt_cap = sh * px if sh else None
+                    px_last = float(stock_df["Close"].dropna().iloc[-1])
+                    mkt_cap = sh * px_last if sh else None
+                equity_is_market = bool(mkt_cap)
+                equity_value = mkt_cap if equity_is_market else (_bs_get(bs, "Total Equity Gross Minority Interest",
+                                                                        "Stockholders Equity", "TotalEquityGrossMinorityInterest") or 0)
+                equity_label = "Market Value" if equity_is_market else "Book Value (fallback)"
 
-                # Cost of debt
-                if total_debt and interest_exp:
-                    rd_pct = (interest_exp / total_debt) * 100
+                # ---- Cost of debt (three methods) ----
+                icr = None
+                if ebit is not None and interest_exp:
+                    icr = ebit / interest_exp
+
+                pre_tax_rd = None
+                rd_label = ""
+                if method == "Observed YTM (publicly traded debt)":
+                    pre_tax_rd = float(ytm_input)
+                    rd_label = "Observed YTM (user input)"
+                elif method == "Actual credit rating (Damodaran spread)":
+                    spread = DAMODARAN_RATING_SPREADS[chosen_rating]
+                    pre_tax_rd = wacc_rf + spread
+                    rd_label = f"Rf + {chosen_rating} spread ({spread:.2f}%)"
+                else:  # synthetic
+                    is_large = (mkt_cap or 0) >= 5e9
+                    if icr is None:
+                        rd_label = "Synthetic (fallback spread \u2014 ICR not available)"
+                        pre_tax_rd = wacc_rf + 2.00
+                        syn_rating = "n/a"
+                        syn_spread = 2.00
+                    else:
+                        syn_rating, syn_spread = _synthetic_rating(icr, is_large)
+                        pre_tax_rd = wacc_rf + syn_spread
+                        rd_label = (f"Synthetic rating {syn_rating} from ICR = {icr:.2f} "
+                                    f"({'large' if is_large else 'small/risky'} firm table; spread {syn_spread:.2f}%)")
+
+                # ---- Market value of debt (Damodaran coupon-bond approx) ----
+                # Treats total debt as a bullet bond paying the company's reported
+                # interest expense as coupon, discounted at pre-tax cost of debt,
+                # with maturity defaulting to 5 years. Matches his Valuation book (ch. 8).
+                def _market_value_of_debt(book_debt: float, interest_expense: float,
+                                          kd_pct: float, maturity_yrs: float = 5.0) -> float:
+                    if not book_debt or kd_pct is None:
+                        return book_debt or 0.0
+                    r = kd_pct / 100
+                    if r == 0:
+                        return book_debt
+                    coupon = interest_expense if interest_expense else book_debt * r
+                    annuity = coupon * (1 - (1 + r) ** (-maturity_yrs)) / r
+                    return annuity + book_debt / ((1 + r) ** maturity_yrs)
+
+                debt_is_market = bool(book_debt and interest_exp and pre_tax_rd)
+                if debt_is_market:
+                    debt_value = _market_value_of_debt(book_debt, interest_exp, pre_tax_rd)
+                    debt_label = "Market Value (Damodaran coupon-bond approx, 5y)"
                 else:
-                    rd_pct = wacc_rf + 1.5  # spread fallback
+                    debt_value = book_debt or 0
+                    debt_label = "Book Value (fallback)" if book_debt else "None reported"
 
-                # CAPM
-                re_pct = wacc_rf + (beta_val or 1.0) * wacc_erp
+                # ---- Preferred stock ----
+                pref_value = 0.0
+                pref_cost_pct = None
+                pref_label = ""
+                pref_is_market = False
+                if has_pref and pref_div_ps and pref_price and pref_price > 0:
+                    pref_cost_pct = (pref_div_ps / pref_price) * 100
+                    if pref_shares and pref_shares > 0:
+                        pref_value = pref_price * pref_shares * 1e6  # shares_in_millions -> shares
+                        pref_is_market = True
+                        pref_label = "Market Value (price \u00d7 shares)"
+                    else:
+                        # Fall back to book value of preferred on the balance sheet, if any.
+                        pref_book = _bs_get(bs, "Preferred Stock Equity", "Preferred Stock", "PreferredStock")
+                        if pref_book:
+                            pref_value = float(pref_book)
+                            pref_label = "Book Value (fallback)"
+                        else:
+                            pref_label = "Cost only (no value supplied)"
+
+                # ---- CAPM ----
+                re_pct = wacc_rf + (beta_val if beta_val is not None else 1.0) * wacc_erp
                 tax = wacc_tax / 100
-                rd_at_pct = rd_pct * (1 - tax)
+                rd_at_pct = pre_tax_rd * (1 - tax)
 
-                if mkt_cap and total_debt:
-                    e_w = mkt_cap / (mkt_cap + total_debt)
-                    d_w = total_debt / (mkt_cap + total_debt)
-                elif mkt_cap:
-                    e_w, d_w = 1.0, 0.0
+                # ---- Weights ----
+                V = (equity_value or 0) + (debt_value or 0) + (pref_value or 0)
+                if V <= 0:
+                    e_w = 1.0; d_w = 0.0; p_w = 0.0
                 else:
-                    e_w, d_w = 0.7, 0.3
+                    e_w = (equity_value or 0) / V
+                    d_w = (debt_value or 0) / V
+                    p_w = (pref_value or 0) / V
 
-                wacc_pct = e_w * re_pct + d_w * rd_at_pct
+                wacc_pct = e_w * re_pct + d_w * rd_at_pct + p_w * (pref_cost_pct or 0)
 
+                # ---- Output ----
                 st.markdown(f"<div class='sub-header'>{info.get('longName') or wacc_ticker} \u2014 Weighted Average Cost of Capital</div>", unsafe_allow_html=True)
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("WACC", f"{wacc_pct:.2f}%" if wacc_pct is not None else "\u2014")
-                m2.metric("Cost of Equity", f"{re_pct:.2f}%")
-                m3.metric("After-Tax Cost of Debt", f"{rd_at_pct:.2f}%")
-                m4.metric("Beta", f"{beta_val:.3f}" if beta_val is not None else "\u2014")
 
-                cap_table = pd.DataFrame({
-                    "Component": ["Equity (Market Cap)", "Total Debt", "Enterprise Value (E+D)"],
-                    "Value ($M)": [
-                        f"{mkt_cap/1e6:,.0f}" if mkt_cap else "\u2014",
-                        f"{total_debt/1e6:,.0f}" if total_debt else "\u2014",
-                        f"{(mkt_cap + total_debt)/1e6:,.0f}" if (mkt_cap and total_debt) else "\u2014",
-                    ],
-                    "Weight": [f"{e_w:.1%}", f"{d_w:.1%}", "100.0%"],
+                # Top metric row depends on whether preferred exists
+                if p_w > 0:
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("WACC", f"{wacc_pct:.2f}%")
+                    m2.metric("Cost of Equity", f"{re_pct:.2f}%")
+                    m3.metric("After-Tax Cost of Debt", f"{rd_at_pct:.2f}%")
+                    m4.metric("Cost of Preferred", f"{(pref_cost_pct or 0):.2f}%")
+                    m5.metric("Beta", f"{beta_val:.3f}" if beta_val is not None else "\u2014")
+                else:
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("WACC", f"{wacc_pct:.2f}%")
+                    m2.metric("Cost of Equity", f"{re_pct:.2f}%")
+                    m3.metric("After-Tax Cost of Debt", f"{rd_at_pct:.2f}%")
+                    m4.metric("Beta", f"{beta_val:.3f}" if beta_val is not None else "\u2014")
+
+                # Capital structure table with explicit MV/BV labels
+                cap_rows = [
+                    {"Component": "Equity", "Basis": equity_label,
+                     "Value ($M)": f"{(equity_value or 0)/1e6:,.0f}",
+                     "Weight": f"{e_w:.1%}", "Cost (pre-tax)": f"{re_pct:.2f}%",
+                     "After-Tax Cost": f"{re_pct:.2f}%"},
+                    {"Component": "Debt", "Basis": debt_label,
+                     "Value ($M)": f"{(debt_value or 0)/1e6:,.0f}" if debt_value else "\u2014",
+                     "Weight": f"{d_w:.1%}", "Cost (pre-tax)": f"{pre_tax_rd:.2f}%",
+                     "After-Tax Cost": f"{rd_at_pct:.2f}%"},
+                ]
+                if has_pref:
+                    cap_rows.append({
+                        "Component": "Preferred Stock",
+                        "Basis": pref_label or "\u2014",
+                        "Value ($M)": f"{(pref_value or 0)/1e6:,.0f}" if pref_value else "\u2014",
+                        "Weight": f"{p_w:.1%}",
+                        "Cost (pre-tax)": f"{(pref_cost_pct or 0):.2f}%" if pref_cost_pct else "\u2014",
+                        "After-Tax Cost": f"{(pref_cost_pct or 0):.2f}%" if pref_cost_pct else "\u2014",
+                    })
+                cap_rows.append({
+                    "Component": "Total Capital (V)", "Basis": "",
+                    "Value ($M)": f"{V/1e6:,.0f}" if V else "\u2014",
+                    "Weight": "100.0%",
+                    "Cost (pre-tax)": "", "After-Tax Cost": f"{wacc_pct:.2f}%",
                 })
-                st.dataframe(cap_table, use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(cap_rows), use_container_width=True, hide_index=True)
 
-                # Sensitivity table: WACC across beta and ERP
+                # Methodology panel \u2014 this is what you asked to be visible on-page.
+                st.markdown("<div class='sub-header'>Methodology Notes</div>", unsafe_allow_html=True)
+                notes = []
+                notes.append(
+                    f"- **Equity value:** {equity_label}. "
+                    + ("Using Yahoo Finance market capitalization (shares outstanding \u00d7 current price)."
+                       if equity_is_market else
+                       "Market cap unavailable from Yahoo \u2014 fell back to book value of stockholders' equity.")
+                )
+                notes.append(
+                    f"- **Debt value:** {debt_label}. "
+                    + ("Market value estimated using Damodaran's coupon-bond approximation: "
+                       "the outstanding book debt is treated as a single bullet bond paying the company's reported interest expense as coupon, "
+                       "discounted at the pre-tax cost of debt over an assumed 5-year maturity."
+                       if debt_is_market else
+                       "Not enough fundamentals to convert to market value, so the book balance-sheet amount is used directly. "
+                       "For most investment-grade issuers book and market are close, so the WACC impact is small.")
+                )
+                if has_pref:
+                    notes.append(
+                        f"- **Preferred stock:** {pref_label}. "
+                        "Cost of preferred = annual preferred dividend per share \u00f7 current preferred price. "
+                        "Weight uses preferred market price \u00d7 shares outstanding where provided."
+                    )
+                notes.append(
+                    f"- **Beta:** {beta_flavor}. "
+                    + (f"Raw regression beta = {raw_beta:.3f} using {wacc_window} of {wacc_freq.lower()} returns vs. ^GSPC."
+                       if raw_beta is not None else
+                       "Insufficient overlapping returns \u2014 beta not computable.")
+                    + (f" Bloomberg-adjusted beta = 0.67 \u00d7 raw + 0.33 = {bloom_beta:.3f}." if bloom_beta is not None else "")
+                )
+                notes.append(f"- **Cost of equity:** CAPM \u2014 Re = Rf + \u03b2 \u00d7 ERP = {wacc_rf:.2f}% + "
+                             f"{(beta_val or 1.0):.3f} \u00d7 {wacc_erp:.2f}% = {re_pct:.2f}%.")
+                notes.append(f"- **Pre-tax cost of debt:** {rd_label}. Pre-tax = {pre_tax_rd:.2f}%, "
+                             f"after-tax = {pre_tax_rd:.2f}% \u00d7 (1 \u2212 {wacc_tax:.1f}%) = {rd_at_pct:.2f}%.")
+                if method == "Synthetic rating from ICR (EBIT / Interest Expense)":
+                    notes.append(
+                        "- **Synthetic credit rating:** Damodaran's Interest Coverage Ratio (EBIT / Interest Expense) "
+                        "is mapped to a rating and default spread using his published table. "
+                        "Large firms (market cap > $5B) use the looser ICR bands; smaller/riskier firms use the tighter bands. "
+                        "Damodaran updates this table annually \u2014 the current version is linked below."
+                    )
+                st.markdown("\n".join(notes))
+
+                # Sensitivity grid \u2014 unchanged conceptually, now uses the new cost of debt
                 st.markdown("<div class='sub-header'>Sensitivity \u2014 WACC at varying Beta and ERP</div>", unsafe_allow_html=True)
-                betas = [(beta_val or 1.0) + d for d in (-0.2, -0.1, 0.0, 0.1, 0.2)]
+                betas = [((beta_val or 1.0)) + d for d in (-0.2, -0.1, 0.0, 0.1, 0.2)]
                 erps = [wacc_erp + d for d in (-1.0, -0.5, 0.0, 0.5, 1.0)]
                 grid = []
                 for b in betas:
                     row = []
                     for e in erps:
                         re_i = wacc_rf + b * e
-                        wacc_i = e_w * re_i + d_w * rd_at_pct
+                        wacc_i = e_w * re_i + d_w * rd_at_pct + p_w * (pref_cost_pct or 0)
                         row.append(f"{wacc_i:.2f}%")
                     grid.append(row)
                 sens = pd.DataFrame(grid, index=[f"\u03b2 {b:.2f}" for b in betas],
                                     columns=[f"ERP {e:.1f}%" for e in erps])
                 st.dataframe(sens, use_container_width=True)
 
-                with st.expander("Assumptions used"):
-                    st.write(f"- Beta: {beta_val:.3f} ({wacc_window} of {wacc_freq.lower()} returns vs. ^GSPC)" if beta_val is not None else "- Beta: not computable")
-                    st.write(f"- Risk-free rate: {wacc_rf:.2f}% (default seeded from US 10Y)")
-                    st.write(f"- ERP: {wacc_erp:.2f}%")
-                    st.write(f"- Pre-tax cost of debt: {rd_pct:.2f}% " + ("(interest expense / total debt)" if (total_debt and interest_exp) else "(fallback: Rf + 1.5%)"))
-                    st.write(f"- Tax rate: {wacc_tax:.1f}%")
+                with st.expander("Data sources and references"):
+                    st.markdown(
+                        "- Synthetic credit rating table: "
+                        "[Damodaran \u2014 Ratings, Interest Coverage Ratios and Default Spread]"
+                        "(https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/ratings.htm) "
+                        "(updated annually; current values encoded reflect the January 2025 update).\n"
+                        "- Implied ERP: [Damodaran \u2014 Implied ERP Monthly Updates]"
+                        "(https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datacurrent.html).\n"
+                        "- Market value of debt methodology: Damodaran, *Investment Valuation*, Ch. 8 (coupon-bond approximation).\n"
+                        "- Bloomberg-adjusted beta formula: 0.67 \u00d7 raw beta + 0.33 (Blume 1971)."
+                    )
 
 
 # =============================================================================
